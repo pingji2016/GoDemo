@@ -12,18 +12,27 @@ import (
 	"github.com/pion/webrtc/v3"
 )
 
-// localTrack 是我们全局唯一的视频轨道
-// 在这个简单的 Demo 中，我们只支持一个发布者，所有订阅者都看这个轨道
+// 全局变量区
+// 在这个简单的 SFU (Selective Forwarding Unit) Demo 中，我们使用最简化的模型：
+// 1. 假设只有一个推流者 (Publisher)
+// 2. 所有的拉流者 (Subscriber) 都观看这个推流者的画面
 var (
-	localTrack  *webrtc.TrackLocalStaticRTP
+	// localTrack 是一个 RTP 数据包的“中转站”。
+	// Publisher 的数据写入这里，Subscriber 从这里读取数据。
+	localTrack *webrtc.TrackLocalStaticRTP
+
+	// publisherPC 保存推流者的 PeerConnection 连接对象。
+	// 我们需要它来向推流者发送 RTCP 控制包（比如请求关键帧 PLI）。
 	publisherPC *webrtc.PeerConnection
-	mu          sync.RWMutex
+
+	// mu 是一个读写锁，保证多线程访问 publisherPC 时的安全。
+	mu sync.RWMutex
 )
 
 func main() {
-	// 1. 初始化全局 Track
-	// 使用 VP8 编码，这是浏览器最常用的视频编码之一
-	// "video" 是 StreamID, "pion" 是 TrackID
+	// 1. 初始化全局 Track (视频轨道)
+	// 我们指定使用 VP8 编码格式，这是 WebRTC 中兼容性最好的视频编码之一。
+	// "video" 是 StreamID (流ID), "pion" 是 TrackID (轨道ID)。
 	track, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
 		"video", "pion",
@@ -34,69 +43,78 @@ func main() {
 	localTrack = track
 
 	// 2. 设置 HTTP 路由
+	// "/" 			-> 返回 index.html 前端页面
+	// "/publish" 	-> 处理推流请求 (Websocket/HTTP-Post 用于交换 SDP)
+	// "/subscribe" -> 处理拉流请求
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "index.html")
 	})
-	http.HandleFunc("/publish", handlePublish)     // 推流接口
-	http.HandleFunc("/subscribe", handleSubscribe) // 拉流接口
+	http.HandleFunc("/publish", handlePublish)
+	http.HandleFunc("/subscribe", handleSubscribe)
 
 	fmt.Println("WebRTC SFU Server started at http://localhost:8080")
+	// 3. 启动 HTTP 服务，监听 8080 端口
 	if err := http.ListenAndServe(":8080", nil); err != nil {
 		panic(err)
 	}
 }
 
 // handlePublish 处理推流请求 (浏览器 -> 服务端)
+// 这里的核心逻辑是：接收浏览器的视频流，并写入到全局的 localTrack 中。
 func handlePublish(w http.ResponseWriter, r *http.Request) {
-	// 创建 PeerConnection
-	// 这里使用默认配置，实际上你应该配置 STUN/TURN 服务器
+	// 1. 创建 PeerConnection (PC)
+	// PC 是 WebRTC 的核心对象，代表一条 P2P 连接。
+	// 这里使用默认配置，在生产环境中，你通常需要配置 STUN/TURN 服务器以穿透 NAT。
 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// 2. 保存 Publisher 的 PC，以便后续发送 PLI 请求
 	mu.Lock()
 	publisherPC = peerConnection
 	mu.Unlock()
 
-	// 处理客户端发送过来的 Track
+	// 3. 监听 "OnTrack" 事件
+	// 当浏览器成功推流并发送数据过来时，会触发这个回调。
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		fmt.Printf("收到新的 Track: %s (Type: %d)\n", track.Codec().MimeType, track.PayloadType())
 
-		// 只处理 VP8
+		// 本 Demo 只处理 VP8 视频流，忽略其他类型（如音频或 VP9/H264）
 		if track.Codec().MimeType != webrtc.MimeTypeVP8 {
 			fmt.Println("本 Demo 只支持 VP8 视频")
 			return
 		}
 
-		// 启动一个循环，专门读取 Publisher 的 RTCP 包 (例如 Receiver Reports)
+		// [重要] 启动一个协程，定期发送 PLI (Picture Loss Indication)
+		// 这是一个简单的“保底”策略：每 3 秒请求一次关键帧。
+		// 这样即使拉流端错过了之前的关键帧（导致花屏或黑屏），最长 3 秒后也能恢复。
 		go func() {
 			ticker := time.NewTicker(time.Second * 3)
 			for range ticker.C {
 				if rtcpErr := peerConnection.WriteRTCP([]rtcp.Packet{
 					&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())},
 				}); rtcpErr != nil {
-					// fmt.Println(rtcpErr)
+					// 忽略发送错误（可能是连接已断开）
 				}
 			}
 		}()
 
-		// 循环读取远端发送的 RTP 包，并写入本地 Track
-		// 这样本地 Track 就有了数据，可以转发给订阅者
-		buf := make([]byte, 1500)
+		// 4. 数据转发循环
+		// 从远程 Track 读取 RTP 包，写入本地 localTrack
+		buf := make([]byte, 1500) // RTP 包通常小于 1500 字节 (MTU 限制)
 		for {
 			n, _, readErr := track.Read(buf)
 			if readErr != nil {
 				if readErr != io.EOF {
 					fmt.Println("Read Error:", readErr)
 				}
-				return
+				return // 退出循环，结束处理
 			}
 
-			// 将数据写入全局 Track
-			// 注意：这里没有处理并发写入的问题（假设只有一个 Publisher）
-			// 也没有处理关键帧请求（PLI），实际场景需要转发 RTCP PLI 给 Publisher
+			// 将读取到的数据写入全局 Track
+			// 这一步完成了“从 Publisher 接收 -> 存入转发器”的过程
 			if _, writeErr := localTrack.Write(buf[:n]); writeErr != nil && writeErr != io.ErrClosedPipe {
 				fmt.Println("Write Error:", writeErr)
 				return
@@ -104,15 +122,17 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
+	// 监听 ICE 连接状态变化，用于调试
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Publisher ICE State: %s\n", connectionState.String())
 	})
 
-	// 处理信令交换 (SDP)
+	// 处理信令交换 (SDP Offer/Answer)
 	doSignaling(w, r, peerConnection)
 }
 
 // handleSubscribe 处理拉流请求 (服务端 -> 浏览器)
+// 这里的核心逻辑是：创建一个新的 PC，把全局的 localTrack 添加进去，发送给浏览器。
 func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -120,15 +140,17 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 将全局 Track 添加到 PeerConnection 中，发送给订阅者
+	// 1. 添加 Track 到 PeerConnection
+	// 这样浏览器就能从这个 PC 接收到 localTrack 中的数据
 	rtpSender, err := peerConnection.AddTrack(localTrack)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// 必须读取 RTCP 包，否则接收缓冲区会堆积导致卡死
-	// 这里我们通过读取并丢弃来保持连接活跃
+	// 2. 读取 RTCP 包 (必须做)
+	// 即使我们只是发送数据，也必须读取对方发来的 RTCP 包（如 NACK, RR）。
+	// 如果不读取，底层的 UDP 缓冲区会填满，导致连接断开或卡死。
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
@@ -140,8 +162,9 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	peerConnection.OnICEConnectionStateChange(func(connectionState webrtc.ICEConnectionState) {
 		fmt.Printf("Subscriber ICE State: %s\n", connectionState.String())
+		// 3. 连接成功后，立即请求关键帧
+		// 这是一个优化：当新用户加入时，不要干等 3 秒的定时器，而是立刻请求最新的画面。
 		if connectionState == webrtc.ICEConnectionStateConnected {
-			// 连接成功后，立即请求关键帧
 			requestKeyFrame()
 		}
 	})
@@ -150,6 +173,7 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 }
 
 // requestKeyFrame 向 Publisher 请求关键帧 (PLI)
+// 关键帧 (KeyFrame/I-Frame) 是一张完整的图片。如果丢失关键帧，后续的 P-Frame (增量帧) 无法解码，会导致花屏。
 func requestKeyFrame() {
 	mu.RLock()
 	defer mu.RUnlock()
@@ -158,6 +182,7 @@ func requestKeyFrame() {
 		return
 	}
 
+	// 遍历 Publisher 的所有接收器，向它们发送 PLI
 	for _, receiver := range publisherPC.GetReceivers() {
 		if receiver.Track() == nil {
 			continue
@@ -171,8 +196,14 @@ func requestKeyFrame() {
 }
 
 // doSignaling 完成 SDP 的交换 (Offer/Answer 模式)
+// 这是 WebRTC 建立连接的标准流程：
+// 1. 客户端发送 Offer (包含它支持的编码、加密算法等)
+// 2. 服务端设置 RemoteDescription
+// 3. 服务端创建 Answer (包含服务端选定的参数)
+// 4. 服务端设置 LocalDescription
+// 5. 交换 ICE Candidates (这里简化为等待所有 Candidates 收集完再一次性返回)
 func doSignaling(w http.ResponseWriter, r *http.Request, pc *webrtc.PeerConnection) {
-	// 1. 读取客户端发来的 Offer
+	// 1. 读取客户端发来的 Offer JSON
 	var offer webrtc.SessionDescription
 	if err := json.NewDecoder(r.Body).Decode(&offer); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -193,23 +224,18 @@ func doSignaling(w http.ResponseWriter, r *http.Request, pc *webrtc.PeerConnecti
 	}
 
 	// 4. 设置本地描述
-	// 这会触发 ICE 收集
+	// 这会触发 ICE Agent 开始收集 Candidates
 	if err := pc.SetLocalDescription(answer); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// 5. 等待 ICE 收集完成
-	// 这是一个阻塞操作，直到所有 Candidates 都收集完毕
-	// 在生产环境中，建议使用 Trickle ICE (分批发送 Candidates) 以加快连接速度
+	// 这是一个阻塞操作，直到所有 Candidates 都收集完毕。
+	// 在生产环境中，为了更快的连接速度，通常使用 Trickle ICE (分批发送)，而不是阻塞等待。
 	<-webrtc.GatheringCompletePromise(pc)
 
 	// 6. 返回包含完整 ICE Candidates 的 Answer
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pc.LocalDescription())
-}
-
-// 简单的辅助函数，模拟关键帧请求（实际未用到，保留作参考）
-func sendPLI(peerConnection *webrtc.PeerConnection) {
-	// 实际需要找到对应的 RTCP Sender 并发送 PLI 包
 }
