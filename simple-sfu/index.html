@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple Go SFU</title>
+    <style>
+        body { font-family: sans-serif; text-align: center; padding: 20px; }
+        .container { display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; }
+        .box { border: 1px solid #ccc; padding: 10px; border-radius: 8px; background: #f9f9f9; }
+        video { width: 320px; height: 240px; background: black; display: block; margin: 10px auto; }
+        button { padding: 10px 20px; font-size: 16px; margin: 10px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        h3 { margin-top: 0; }
+    </style>
+</head>
+<body>
+    <h1>Go WebRTC SFU Demo</h1>
+    <p>说明：先点击“开始推流”，然后在同一页面（或新标签页）点击“开始拉流”查看效果。</p>
+    
+    <div class="container">
+        <!-- 推流部分 -->
+        <div class="box">
+            <h3>1. 推流端 (Publisher)</h3>
+            <video id="localVideo" autoplay playsinline muted></video>
+            <button id="btnPublish" onclick="publish()">开始推流</button>
+            <div id="pubStatus">未连接</div>
+        </div>
+        
+        <!-- 拉流部分 -->
+        <div class="box">
+            <h3>2. 拉流端 (Subscriber)</h3>
+            <video id="remoteVideo" autoplay playsinline controls></video>
+            <button id="btnSubscribe" onclick="subscribe()">开始拉流</button>
+            <div id="subStatus">未连接</div>
+        </div>
+    </div>
+
+    <script>
+        // 推流逻辑
+        async function publish() {
+            const status = document.getElementById('pubStatus');
+            status.innerText = "正在获取屏幕共享...";
+            
+            const pc = new RTCPeerConnection();
+            
+            try {
+                // 1. 获取屏幕共享 (系统音频可选)
+                const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+                document.getElementById('localVideo').srcObject = stream;
+
+                // 2. 添加 Track 到 PC
+                stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+                status.innerText = "正在建立连接...";
+
+                // 3. 创建 Offer
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                // 等待 ICE 收集完成 (确保 SDP 包含所有 Candidate)
+                await waitIceGathering(pc);
+
+                // 4. 发送给服务器
+                const response = await fetch('/publish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(pc.localDescription)
+                });
+
+                if (!response.ok) throw new Error("Server error: " + response.statusText);
+
+                const answer = await response.json();
+                await pc.setRemoteDescription(answer);
+                
+                document.getElementById('btnPublish').disabled = true;
+                status.innerText = "推流中 (Connected)";
+            } catch (e) {
+                console.error(e);
+                status.innerText = "错误: " + e.message;
+            }
+        }
+
+        // 拉流逻辑
+        async function subscribe() {
+            const status = document.getElementById('subStatus');
+            status.innerText = "正在连接...";
+            
+            const pc = new RTCPeerConnection();
+
+            try {
+                // 1. 添加 Transceiver，告诉服务器我们想收视频
+                // 'recvonly' 表示我们要接收
+                pc.addTransceiver('video', { direction: 'recvonly' });
+
+                // 2. 监听 Track 事件，收到流后播放
+                pc.ontrack = (event) => {
+                    console.log("Received remote track");
+                    const el = document.getElementById('remoteVideo');
+                    if (el.srcObject !== event.streams[0]) {
+                        el.srcObject = event.streams[0];
+                    }
+                };
+
+                // 3. 创建 Offer
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+
+                await waitIceGathering(pc);
+
+                // 4. 发送给服务器
+                const response = await fetch('/subscribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(pc.localDescription)
+                });
+
+                if (!response.ok) throw new Error("Server error: " + response.statusText);
+
+                const answer = await response.json();
+                await pc.setRemoteDescription(answer);
+
+                document.getElementById('btnSubscribe').disabled = true;
+                status.innerText = "拉流中 (Connected)";
+            } catch (e) {
+                console.error(e);
+                status.innerText = "错误: " + e.message;
+            }
+        }
+
+        // 辅助函数：等待 ICE 收集完成
+        function waitIceGathering(pc) {
+            return new Promise(resolve => {
+                if (pc.iceGatheringState === 'complete') {
+                    resolve();
+                } else {
+                    const checkState = () => {
+                        if (pc.iceGatheringState === 'complete') {
+                            pc.removeEventListener('icegatheringstatechange', checkState);
+                            resolve();
+                        }
+                    };
+                    pc.addEventListener('icegatheringstatechange', checkState);
+                }
+            });
+        }
+    </script>
+</body>
+</html>
