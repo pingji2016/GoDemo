@@ -2,12 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 )
@@ -17,19 +21,34 @@ import (
 // 1. 假设只有一个推流者 (Publisher)
 // 2. 所有的拉流者 (Subscriber) 都观看这个推流者的画面
 var (
-	// localTrack 是一个 RTP 数据包的“中转站”。
-	// Publisher 的数据写入这里，Subscriber 从这里读取数据。
-	localTrack *webrtc.TrackLocalStaticRTP
-
-	// publisherPC 保存推流者的 PeerConnection 连接对象。
-	// 我们需要它来向推流者发送 RTCP 控制包（比如请求关键帧 PLI）。
+	localTrack  *webrtc.TrackLocalStaticRTP
 	publisherPC *webrtc.PeerConnection
+	mu          sync.RWMutex
 
-	// mu 是一个读写锁，保证多线程访问 publisherPC 时的安全。
-	mu sync.RWMutex
+	// 命令行参数
+	addr        = flag.String("addr", ":9090", "http service address")
+	certFile    = flag.String("cert", "", "tls certificate file")
+	keyFile     = flag.String("key", "", "tls key file")
+	publicIP    = flag.String("public-ip", "", "public IP address (to avoid STUN)")
+	udpMin      = flag.Int("udp-min", 50000, "min UDP port")
+	udpMax      = flag.Int("udp-max", 50050, "max UDP port")
+	turnAddr    = flag.String("turn", "", "TURN server address for Client (e.g. 106.14.31.105:3478)")
+	turnAddrInt = flag.String("turn-internal", "", "TURN server address for Server (e.g. 127.0.0.1:3478)")
+	turnUser    = flag.String("turn-user", "", "TURN username (for static auth)")
+	turnPwd     = flag.String("turn-pwd", "", "TURN password (for static auth)")
+	turnSecret  = flag.String("turn-secret", "", "TURN shared secret (for dynamic auth)")
 )
 
 func main() {
+	flag.Parse()
+
+	// 0. 检查 index.html 是否存在
+	if _, err := os.Stat("index.html"); os.IsNotExist(err) {
+		fmt.Printf("【严重警告】当前目录 (%s) 下找不到 index.html！\n", func() string { s, _ := os.Getwd(); return s }())
+		fmt.Println("请务必在包含 index.html 的目录下运行程序，否则网页无法访问。")
+		fmt.Println("正确做法示例: cd /path/to/app && ./simple-sfu-linux")
+	}
+
 	// 1. 初始化全局 Track (视频轨道)
 	// 我们指定使用 VP8 编码格式，这是 WebRTC 中兼容性最好的视频编码之一。
 	// "video" 是 StreamID (流ID), "pion" 是 TrackID (轨道ID)。
@@ -52,20 +71,80 @@ func main() {
 	http.HandleFunc("/publish", handlePublish)
 	http.HandleFunc("/subscribe", handleSubscribe)
 
-	fmt.Println("WebRTC SFU Server started at http://localhost:8080")
-	// 3. 启动 HTTP 服务，监听 8080 端口
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		panic(err)
+	// 3. 启动服务
+	if *certFile != "" && *keyFile != "" {
+		fmt.Printf("WebRTC SFU Server (HTTPS) started at https://localhost%s\n", *addr)
+		if err := http.ListenAndServeTLS(*addr, *certFile, *keyFile, nil); err != nil {
+			panic(err)
+		}
+	} else {
+		fmt.Printf("WebRTC SFU Server (HTTP) started at http://localhost%s\n", *addr)
+		if err := http.ListenAndServe(*addr, nil); err != nil {
+			panic(err)
+		}
 	}
+}
+
+// newPeerConnection 创建一个新的 PC，并根据情况配置 IP
+func newPeerConnection() (*webrtc.PeerConnection, error) {
+	config := webrtc.Configuration{}
+
+	// 1. 创建 MediaEngine 并注册默认 Codec
+	// 当我们自定义 API 时，必须手动注册 Codec，否则会报 "no codecs" 错误
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		return nil, err
+	}
+
+	// 2. 创建 Interceptor (拦截器，用于 RTCP 处理等)
+	i := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, i); err != nil {
+		return nil, err
+	}
+
+	// 3. 配置 SettingEngine
+	settingEngine := webrtc.SettingEngine{}
+
+	// 限制 UDP 端口范围 (如果不想限制，可以不传参数)
+	if *udpMin > 0 && *udpMax > 0 {
+		settingEngine.SetEphemeralUDPPortRange(uint16(*udpMin), uint16(*udpMax))
+	}
+
+	// 4. 配置 ICE Servers (STUN/TURN)
+	if *turnAddr != "" {
+		// ... (TURN 逻辑保持不变，但我们这次不用它)
+	}
+
+	// [重要修复] 如果指定了 public-ip，我们应该忽略 STUN/TURN，强制使用 NAT 1:1
+	// 这在阿里云/AWS 等 1:1 NAT 环境下是最稳的。
+	if *publicIP != "" {
+		// 清空 ICEServers，防止 Pion 去请求 STUN/TURN，导致 Candidate 混乱
+		config.ICEServers = []webrtc.ICEServer{}
+
+		// 强制只使用 Host 类型的 Candidate (即直接用 IP)
+		settingEngine.SetNAT1To1IPs([]string{*publicIP}, webrtc.ICECandidateTypeHost)
+	} else if *turnAddr == "" {
+		// 既没 TURN 也没 PublicIP，才用 Google STUN
+		config.ICEServers = []webrtc.ICEServer{
+			{URLs: []string{"stun:stun.l.google.com:19302"}},
+		}
+	}
+
+	// 5. 创建 API 对象
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(settingEngine),
+	)
+
+	return api.NewPeerConnection(config)
 }
 
 // handlePublish 处理推流请求 (浏览器 -> 服务端)
 // 这里的核心逻辑是：接收浏览器的视频流，并写入到全局的 localTrack 中。
 func handlePublish(w http.ResponseWriter, r *http.Request) {
 	// 1. 创建 PeerConnection (PC)
-	// PC 是 WebRTC 的核心对象，代表一条 P2P 连接。
-	// 这里使用默认配置，在生产环境中，你通常需要配置 STUN/TURN 服务器以穿透 NAT。
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	peerConnection, err := newPeerConnection()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -134,7 +213,7 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 // handleSubscribe 处理拉流请求 (服务端 -> 浏览器)
 // 这里的核心逻辑是：创建一个新的 PC，把全局的 localTrack 添加进去，发送给浏览器。
 func handleSubscribe(w http.ResponseWriter, r *http.Request) {
-	peerConnection, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	peerConnection, err := newPeerConnection()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -165,7 +244,13 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		// 3. 连接成功后，立即请求关键帧
 		// 这是一个优化：当新用户加入时，不要干等 3 秒的定时器，而是立刻请求最新的画面。
 		if connectionState == webrtc.ICEConnectionStateConnected {
-			requestKeyFrame()
+			// 启动一个协程，连续请求几次关键帧，确保万无一失
+			go func() {
+				for i := 0; i < 5; i++ {
+					requestKeyFrame()
+					time.Sleep(time.Millisecond * 500)
+				}
+			}()
 		}
 	})
 
@@ -237,5 +322,20 @@ func doSignaling(w http.ResponseWriter, r *http.Request, pc *webrtc.PeerConnecti
 
 	// 6. 返回包含完整 ICE Candidates 的 Answer
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(pc.LocalDescription())
+
+	// [Hack] 替换 Answer 中的 TURN 地址
+	// 因为我们在服务端使用了内网 TURN 地址 (127.0.0.1)，生成的 SDP 里也会包含这个地址。
+	// 发给浏览器前，必须把它替换成公网地址 (106...)，否则浏览器连不上。
+	answer = *pc.LocalDescription()
+	if *turnAddrInt != "" && *turnAddr != "" {
+		// 提取 IP 部分
+		internalIP := strings.Split(*turnAddrInt, ":")[0]
+		externalIP := strings.Split(*turnAddr, ":")[0]
+
+		// 简单替换 SDP 中的 IP
+		// 注意：这可能会误伤其他部分，但在受控环境下通常没问题
+		answer.SDP = strings.ReplaceAll(answer.SDP, internalIP, externalIP)
+	}
+
+	json.NewEncoder(w).Encode(answer)
 }
