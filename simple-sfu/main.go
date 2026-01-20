@@ -49,17 +49,7 @@ func main() {
 		fmt.Println("正确做法示例: cd /path/to/app && ./simple-sfu-linux")
 	}
 
-	// 1. 初始化全局 Track (视频轨道)
-	// 我们指定使用 VP8 编码格式，这是 WebRTC 中兼容性最好的视频编码之一。
-	// "video" 是 StreamID (流ID), "pion" 是 TrackID (轨道ID)。
-	track, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8},
-		"video", "pion",
-	)
-	if err != nil {
-		panic(err)
-	}
-	localTrack = track
+	// 1. 延迟初始化全局 Track，等待 Publisher 的真实编码到来
 
 	// 2. 设置 HTTP 路由
 	// "/" 			-> 返回 index.html 前端页面
@@ -160,11 +150,21 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 		fmt.Printf("收到新的 Track: %s (Type: %d)\n", track.Codec().MimeType, track.PayloadType())
 
-		// 本 Demo 只处理 VP8 视频流，忽略其他类型（如音频或 VP9/H264）
-		if track.Codec().MimeType != webrtc.MimeTypeVP8 {
-			fmt.Println("本 Demo 只支持 VP8 视频")
-			return
+		// 初始化或切换到 Publisher 的实际编码
+		mu.Lock()
+		if localTrack == nil {
+			newLocal, err := webrtc.NewTrackLocalStaticRTP(
+				webrtc.RTPCodecCapability{MimeType: track.Codec().MimeType},
+				"video", "pion",
+			)
+			if err == nil {
+				localTrack = newLocal
+			} else {
+				mu.Unlock()
+				return
+			}
 		}
+		mu.Unlock()
 
 		// [重要] 启动一个协程，定期发送 PLI (Picture Loss Indication)
 		// 这是一个简单的“保底”策略：每 3 秒请求一次关键帧。
@@ -194,7 +194,13 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 
 			// 将读取到的数据写入全局 Track
 			// 这一步完成了“从 Publisher 接收 -> 存入转发器”的过程
-			if _, writeErr := localTrack.Write(buf[:n]); writeErr != nil && writeErr != io.ErrClosedPipe {
+			mu.RLock()
+			lt := localTrack
+			mu.RUnlock()
+			if lt == nil {
+				continue
+			}
+			if _, writeErr := lt.Write(buf[:n]); writeErr != nil && writeErr != io.ErrClosedPipe {
 				fmt.Println("Write Error:", writeErr)
 				return
 			}
@@ -221,7 +227,14 @@ func handleSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	// 1. 添加 Track 到 PeerConnection
 	// 这样浏览器就能从这个 PC 接收到 localTrack 中的数据
-	rtpSender, err := peerConnection.AddTrack(localTrack)
+	mu.RLock()
+	lt := localTrack
+	mu.RUnlock()
+	if lt == nil {
+		http.Error(w, "publisher 未就绪，暂无可用视频轨道", http.StatusServiceUnavailable)
+		return
+	}
+	rtpSender, err := peerConnection.AddTrack(lt)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
