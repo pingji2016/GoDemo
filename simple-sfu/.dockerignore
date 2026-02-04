@@ -1,0 +1,18 @@
+# Git
+.git
+.gitignore
+
+# Go build output
+simple-sfu
+simple-sfu-linux
+*.exe
+*.test
+*.out
+
+# IDEs
+.idea
+.vscode
+
+# Docker
+Dockerfile
+.dockerignore
