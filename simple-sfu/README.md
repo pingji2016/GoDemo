@@ -16,6 +16,7 @@
 - 安装 [Go 1.20+](https://go.dev/dl/) 环境。
 
 ### 运行步骤
+go env -w GOPROXY=https://goproxy.cn,direct
 1. **下载依赖**
    ```bash
    go mod tidy
